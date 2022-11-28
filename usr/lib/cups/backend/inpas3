@@ -1,0 +1,159 @@
+#!/bin/bash
+
+# custom CUPS backend for the INPAS system from HOER electronic
+# (emulates the functionality of trIPP.exe)
+# requires: nc
+
+# === CUPS Parameter ===
+# $DEVICE_URI
+# $1 --> job ID
+# $2 --> user name
+# $3 --> job name
+# $4 --> number of copies
+# $5 --> job options
+# $6 --> file to print
+
+
+# get serveraddress and port from device uri
+DEVICE=${DEVICE_URI#*://} # remove protocol "inpas3://"
+SERVERADDRESS=$(echo "$DEVICE" | cut -d: -f1) # separate ip address
+SERVERPORT=$(echo "$DEVICE" | cut -d: -f2 | cut -d/ -f1) # separate port
+SERVERQUEUE="/"$(echo "$DEVICE" | cut -d/ -f2,3,4,5,6,7,8,9) # separate queue
+DEVICE_URI_REAL="ipp://"$DEVICE
+
+# define functions
+function cleanup {
+	echo "done" > /tmp/printjob/status
+	rm /tmp/printjob/body
+	rm /tmp/printjob/card-id
+	rm /tmp/printjob/job-name
+}
+function length {
+	COUNT=$(echo -e -n $1 | wc -c)
+	HEXCOUNT=$(echo "obase=16; $COUNT" | bc)
+	WITHZERO=$(printf '%02x' "0x$HEXCOUNT")
+	BYTE="\\x$WITHZERO"
+}
+
+# create temp directory
+if [ ! -d /tmp/printjob ]; then
+	mkdir /tmp/printjob
+	chmod 777 /tmp/printjob
+fi
+echo "need-parameter" > /tmp/printjob/status
+chmod 777 /tmp/printjob/status
+
+# wait here until user entered card-id and job-name
+# notifier3.sh, executed as logged-in user, will update the status file
+while ! grep -q set-parameter /tmp/printjob/status; do
+	sleep 1
+done
+
+# status update
+echo "sending" > /tmp/printjob/status
+
+# create ipp parameter string
+x00="\\x00"
+x01="\\x01"
+x02="\\x02"
+LINE="\\x0d\\x0a"
+
+BODY="$x01$x01$x00$x02$x00$x00$x00$x01$x01" # header
+BODY+="G" # ???
+
+BODY+="$x00" # begin parameter
+BODY+="\\x12" # parameter name length
+BODY+="attributes-charset" # parameter name
+BODY+="$x00" # separator
+BODY+="\\x08" # parameter content length
+BODY+="us-ascii" # parameter content
+BODY+="H" # ???
+
+BODY+="$x00"
+BODY+="\\x1b"
+BODY+="attributes-natural-language"
+BODY+="$x00"
+BODY+="\\x02"
+BODY+="en"
+BODY+="E"
+
+BODY+="$x00"
+BODY+="\\x0b"
+BODY+="printer-uri"
+BODY+="$x00"
+ length "$DEVICE_URI_REAL"
+BODY+="$BYTE"
+BODY+="$DEVICE_URI_REAL"
+BODY+="B"
+
+BODY+="$x00"
+BODY+="\\x14"
+BODY+="requesting-user-name"
+BODY+="$x00"
+ length "$2"
+BODY+="$BYTE"
+BODY+="$2"
+BODY+="B"
+
+BODY+="$x00"
+BODY+="\\x19"
+BODY+="job-originating-user-name"
+BODY+="$x00"
+ length "$2"
+BODY+="$BYTE"
+BODY+="$2"
+BODY+="B"
+
+BODY+="$x00"
+BODY+="\\x07"
+BODY+="card-id"
+BODY+="$x00"
+ # read card id and length in byte
+ CARDID=$(cat /tmp/printjob/card-id)
+ if [[ ! "$CARDID" =~ ^[0-9]+$ ]]; then cleanup; exit 255; fi; # invalid card-id -> abort
+ length "$CARDID"
+BODY+="$BYTE"
+BODY+="$CARDID"
+BODY+="B"
+
+BODY+="$x00"
+BODY+="\\x08"
+BODY+="job-name"
+BODY+="$x00"
+ # read job name and length in byte
+ JOBNAME=$(cat /tmp/printjob/job-name)
+ if [ "$JOBNAME" == "" ]; then JOBNAME="Unbenannt"; fi; # no job-name -> default name
+ if [[ ! "$JOBNAME" =~ ^[0-9a-zA-Z_]+$ ]]; then JOBNAME="???"; fi; # invalid job-name -> use "???" as job-name
+ length "$JOBNAME"
+BODY+="$BYTE"
+BODY+="$JOBNAME"
+
+# separator to document body
+BODY+="\\x03"
+
+# write body to file
+echo -e -n "$BODY" > /tmp/printjob/body
+cat - >> /tmp/printjob/body
+
+# get/calc lengths
+TOTALCOUNT=$(wc -c "/tmp/printjob/body" | cut -d" " -f1) # count document bytes
+
+
+# create IPP header
+HEADER="POST $SERVERQUEUE HTTP/1.1"
+HEADER+="$LINE"
+HEADER+="Host: $SERVERADDRESS"
+HEADER+="$LINE"
+HEADER+="Content-Type: application/ipp"
+HEADER+="$LINE"
+HEADER+="Content-Length: $TOTALCOUNT"
+HEADER+="$LINE$LINE"
+
+
+# send document
+# nc -l localhost 12000 > input_neu.txt
+# nc 127.0.0.1 12000 < out.txt
+(echo -e -n "$HEADER"; cat /tmp/printjob/body) | nc -q 0 $SERVERADDRESS $SERVERPORT > /tmp/printjob/response
+
+# call clean up function
+cleanup
